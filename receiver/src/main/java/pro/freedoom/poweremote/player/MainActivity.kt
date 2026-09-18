@@ -158,6 +158,21 @@ private fun ReceiverScreen(ctx: Context, @Suppress("UNUSED_PARAMETER") tick: Int
             onRefresh()
         }
 
+        val powerampHere = remember { Poweramp.isInstalled(ctx) }
+        val canBrowse = remember(tick) { if (powerampHere) Poweramp.canBrowse(ctx) else false }
+        if (powerampHere) {
+            Step(
+                n = 4,
+                title = "Библиотека Poweramp (необязательно)",
+                done = canBrowse,
+                hint = "Нужно для просмотра папок с телефона. Poweramp покажет запрос на этом " +
+                        "экране — подтвердите его.",
+                action = "Запросить доступ"
+            ) {
+                Poweramp.askDataPermission(ctx, fromForeground = true)
+            }
+        }
+
         Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF16171D))) {
             Row(
                 Modifier

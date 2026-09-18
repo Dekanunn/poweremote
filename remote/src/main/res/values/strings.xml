@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Пульт M33</string>
+    <string name="widget_small_desc">Компактная полоска: трек и кнопки</string>
+    <string name="widget_large_desc">Обложка, трек, кнопки и громкость</string>
 </resources>

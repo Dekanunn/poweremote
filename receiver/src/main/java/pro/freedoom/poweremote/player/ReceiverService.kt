@@ -26,6 +26,7 @@ import pro.freedoom.poweremote.shared.FrameWriter
 import pro.freedoom.poweremote.shared.Link
 import pro.freedoom.poweremote.shared.PlayerState
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -87,6 +88,9 @@ class ReceiverService : Service() {
     private var lastPush = 0L
     private var modeReceiverRegistered = false
 
+    /** Чтение библиотеки Poweramp — в своём потоке, это запросы к БД. */
+    private val library = Executors.newSingleThreadExecutor()
+
     /** Poweramp сообщает о смене shuffle/repeat широковещательно. */
     private val modeReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, i: Intent?) {
@@ -139,6 +143,7 @@ class ReceiverService : Service() {
 
     override fun onDestroy() {
         shutdown()
+        try { library.shutdownNow() } catch (_: Exception) {}
         super.onDestroy()
     }
 
@@ -253,6 +258,7 @@ class ReceiverService : Service() {
     /** Исполняется в главном потоке: MediaController требует Looper. */
     private fun execute(o: JSONObject) {
         val v = o.optLong(Cmd.VALUE, 0L)
+        val x = o.optLong(Cmd.EXTRA, 0L)
         when (o.optString(Cmd.KEY)) {
             Cmd.TOGGLE -> hub.toggle()
             Cmd.PLAY -> hub.play()
@@ -260,14 +266,44 @@ class ReceiverService : Service() {
             Cmd.NEXT -> hub.next()
             Cmd.PREV -> hub.prev()
             Cmd.SEEK -> hub.seek(v)
+            Cmd.SEEK_REL -> hub.seekRelative(v)
             Cmd.VOLUME -> hub.setVolume(v.toInt())
             Cmd.VOLUME_DELTA -> hub.nudgeVolume(v.toInt())
             Cmd.SHUFFLE -> hub.toggleShuffle()
             Cmd.REPEAT -> hub.cycleRepeat()
             Cmd.RATING -> hub.setRating(v.toInt())
+            Cmd.LIKE -> hub.like()
+            Cmd.UNLIKE -> hub.unlike()
+            Cmd.NEXT_CAT -> hub.nextCategory()
+            Cmd.PREV_CAT -> hub.prevCategory()
+            Cmd.SLEEP -> hub.setSleep(v, x == 1L)
+            Cmd.ASK_DATA -> {
+                Poweramp.askDataPermission(this)
+                hub.invalidateBrowse()
+            }
+            Cmd.BROWSE -> browse(v)
+            Cmd.PLAY_FOLDER -> Poweramp.playFolder(this, v)
+            Cmd.PLAY_FILE -> Poweramp.playFile(this, x, v)
             Cmd.HELLO, Cmd.SYNC, Cmd.PING -> sentArtKey = null   // заставим переслать обложку
         }
         dirty = true
+    }
+
+    /** Список папки читаем в фоне и шлём отдельным сообщением "list". */
+    private fun browse(folderId: Long) {
+        if (library.isShutdown) return
+        try {
+            library.execute {
+                val listing = Poweramp.browse(this, folderId)
+                val w = writer ?: return@execute
+                try {
+                    w.writeText(Link.TYPE_JSON, listing.toJson().toString())
+                } catch (e: Exception) {
+                    Log.i(TAG, "Список не ушёл: ${e.message}")
+                }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     /**
@@ -284,7 +320,7 @@ class ReceiverService : Service() {
             val state = snapshotOnMain() ?: continue
             try {
                 w.writeText(Link.TYPE_JSON, state.toJson().toString())
-                if (state.artKey != sentArtKey) {
+                if (state.artKey != sentArtKey && hub.artReady) {
                     w.write(Link.TYPE_ART, hub.artJpeg ?: ByteArray(0))
                     sentArtKey = state.artKey
                 }

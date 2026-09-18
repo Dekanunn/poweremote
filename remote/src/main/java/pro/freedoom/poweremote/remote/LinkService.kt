@@ -1,38 +1,38 @@
 package pro.freedoom.poweremote.remote
 
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import org.json.JSONObject
 import pro.freedoom.poweremote.shared.Cmd
 import pro.freedoom.poweremote.shared.FrameReader
 import pro.freedoom.poweremote.shared.FrameWriter
+import pro.freedoom.poweremote.shared.LibListing
 import pro.freedoom.poweremote.shared.Link
 import pro.freedoom.poweremote.shared.PlayerState
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Держит Bluetooth-соединение с плеером: подключается, переподключается
- * при обрыве и разбирает входящие кадры.
+ * при обрыве, разбирает входящие кадры и зеркалит состояние в медиа-сессию
+ * телефона, уведомление и виджеты.
  */
 class LinkService : Service() {
 
     companion object {
         private const val TAG = "LinkService"
-        private const val CHANNEL = "link"
-        private const val NOTIF_ID = 7
 
         const val EXTRA_MAC = "mac"
         const val ACTION_CONNECT = "connect"
@@ -40,21 +40,41 @@ class LinkService : Service() {
 
         @Volatile private var instance: LinkService? = null
 
+        /** Команда, которую надо отправить сразу после подключения (кнопка виджета без связи). */
+        @Volatile private var queued: JSONObject? = null
+
         fun connect(ctx: Context, mac: String) {
             val i = Intent(ctx, LinkService::class.java)
                 .setAction(ACTION_CONNECT)
                 .putExtra(EXTRA_MAC, mac)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
-            else ctx.startService(i)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.startForegroundService(i)
+                else ctx.startService(i)
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось запустить сервис: ${e.message}")
+            }
         }
 
         fun disconnect(ctx: Context) {
-            ctx.startService(Intent(ctx, LinkService::class.java).setAction(ACTION_DISCONNECT))
+            try {
+                ctx.startService(Intent(ctx, LinkService::class.java).setAction(ACTION_DISCONNECT))
+            } catch (_: Exception) {
+            }
         }
 
         /** Отправка команды из UI. Без соединения просто молча игнорируется. */
-        fun send(cmd: String, value: Long? = null) {
-            instance?.post(Cmd.of(cmd, value))
+        fun send(cmd: String, value: Long? = null, extra: Long? = null) {
+            instance?.post(Cmd.of(cmd, value, extra))
+        }
+
+        fun queueAfterConnect(o: JSONObject) {
+            queued = o
+        }
+
+        /** Запросить содержимое папки библиотеки. */
+        fun browse(folderId: Long) {
+            LinkBus.setLibLoading(true)
+            send(Cmd.BROWSE, folderId)
         }
     }
 
@@ -66,7 +86,19 @@ class LinkService : Service() {
     @Volatile private var writer: FrameWriter? = null
     private var mac: String? = null
 
+    private val main = Handler(Looper.getMainLooper())
+    private lateinit var phone: PhoneSession
+    private var lastNotifText = ""
+
+    /** Одна очередь на отправку: команды уходят в том порядке, в каком нажаты. */
+    private val sender = Executors.newSingleThreadExecutor()
+
     override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        phone = PhoneSession(this) { cmd, value -> post(Cmd.of(cmd, value)) }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -78,7 +110,7 @@ class LinkService : Service() {
                 val target = intent.getStringExtra(EXTRA_MAC) ?: return START_NOT_STICKY
                 instance = this
                 try {
-                    startForeground(NOTIF_ID, buildNotification("Подключение…"))
+                    startForeground(PhoneSession.NOTIF_ID, phone.notification(null, null, "Подключение…"))
                 } catch (e: Exception) {
                     // Android 14+ не даёт поднять сервис типа connectedDevice
                     // без разрешения BLUETOOTH_CONNECT.
@@ -102,6 +134,16 @@ class LinkService : Service() {
                     worker?.interrupt()
                 }
             }
+            null -> {
+                // Перезапуск системой после убийства процесса — восстанавливаемся.
+                val m = mac ?: Prefs(this).mac
+                if (m != null) return onStartCommand(
+                    Intent(this, LinkService::class.java).setAction(ACTION_CONNECT).putExtra(EXTRA_MAC, m),
+                    flags, startId
+                )
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
         return START_REDELIVER_INTENT
     }
@@ -109,6 +151,7 @@ class LinkService : Service() {
     override fun onDestroy() {
         shutdown()
         try { sender.shutdownNow() } catch (_: Exception) {}
+        phone.release()
         super.onDestroy()
     }
 
@@ -118,6 +161,9 @@ class LinkService : Service() {
         LinkBus.setStatus(LinkStatus.IDLE)
         LinkBus.setState(null)
         LinkBus.setArt(null)
+        LinkBus.setListing(null)
+        phone.setActive(false)
+        NowPlayingWidget.push(this, null, null, false)
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -134,9 +180,6 @@ class LinkService : Service() {
         socket = null
         writer = null
     }
-
-    /** Одна очередь на отправку: команды уходят в том порядке, в каком нажаты. */
-    private val sender = java.util.concurrent.Executors.newSingleThreadExecutor()
 
     fun post(o: JSONObject) {
         val w = writer ?: return
@@ -165,6 +208,7 @@ class LinkService : Service() {
             if (adapter == null || !adapter.isEnabled) {
                 LinkBus.setError("Bluetooth выключен")
                 LinkBus.setStatus(LinkStatus.LOST)
+                mirror("Bluetooth выключен")
                 sleep(2500)
                 continue
             }
@@ -177,7 +221,7 @@ class LinkService : Service() {
             }
 
             LinkBus.setStatus(LinkStatus.CONNECTING)
-            update("Подключение к ${safeName(device)}…")
+            mirror("Подключение к ${safeName(device)}…")
             try {
                 try { adapter.cancelDiscovery() } catch (_: SecurityException) {}
                 val s = device.createInsecureRfcommSocketToServiceRecord(Link.SERVICE_UUID)
@@ -187,9 +231,10 @@ class LinkService : Service() {
                 LinkBus.setDevice(safeName(device))
                 LinkBus.setStatus(LinkStatus.CONNECTED)
                 LinkBus.setError("")
-                update("Подключено: ${safeName(device)}")
+                mirror("Подключено: ${safeName(device)}")
                 backoff = 1500L
                 post(Cmd.of(Cmd.HELLO))
+                queued?.let { post(it); queued = null }
                 pump(FrameReader(s.inputStream), stop)
             } catch (e: SecurityException) {
                 LinkBus.setError("Нет разрешения на Bluetooth")
@@ -203,7 +248,7 @@ class LinkService : Service() {
             }
 
             if (stop.get()) break
-            update("Нет связи, повтор…")
+            mirror("Нет связи, повтор…")
             sleep(backoff)
             backoff = (backoff * 2).coerceAtMost(15000L)
         }
@@ -215,19 +260,9 @@ class LinkService : Service() {
             when (frame.type) {
                 Link.TYPE_JSON -> {
                     val o = JSONObject(String(frame.payload, Charsets.UTF_8))
-                    if (o.optString("t") == "state") {
-                        val s = PlayerState.fromJson(o)
-                        val now = System.currentTimeMillis()
-                        // Пока пользователь тянет ползунок, свежие значения плеера
-                        // не перетирают то, что он сейчас выставляет.
-                        val merged = s.copy(
-                            position = if (now < LinkBus.pendingSeekUntil)
-                                LinkBus.pendingSeekValue else s.position,
-                            volume = if (now < LinkBus.pendingVolumeUntil)
-                                LinkBus.pendingVolumeValue else s.volume
-                        )
-                        LinkBus.setState(merged)
-                        LinkBus.setStatus(LinkStatus.CONNECTED)
+                    when (o.optString("t")) {
+                        "state" -> onState(PlayerState.fromJson(o))
+                        "list" -> LinkBus.setListing(LibListing.fromJson(o))
                     }
                 }
                 Link.TYPE_ART -> {
@@ -237,8 +272,58 @@ class LinkService : Service() {
                         null
                     }
                     LinkBus.setArt(bmp)
+                    mirrorState()
                 }
             }
+        }
+    }
+
+    private fun onState(s: PlayerState) {
+        val now = System.currentTimeMillis()
+        // Пока пользователь тянет ползунок, свежие значения плеера
+        // не перетирают то, что он сейчас выставляет.
+        val merged = s.copy(
+            position = if (now < LinkBus.pendingSeekUntil) LinkBus.pendingSeekValue else s.position,
+            volume = if (now < LinkBus.pendingVolumeUntil) LinkBus.pendingVolumeValue else s.volume
+        )
+        LinkBus.setState(merged)
+        LinkBus.setStatus(LinkStatus.CONNECTED)
+        mirrorState()
+    }
+
+    // --------------------------------------------- сессия, уведомление, виджет
+
+    /** Зеркалим состояние в медиа-сессию, уведомление и виджеты (в главном потоке). */
+    private fun mirrorState() {
+        main.post {
+            val s = LinkBus.state.value
+            val art = LinkBus.art.value
+            val connected = LinkBus.status.value == LinkStatus.CONNECTED
+            phone.update(s, art, connected)
+            val text = if (connected) "Плеер: ${LinkBus.deviceName.value}" else lastNotifText
+            notify(s, art, text)
+            NowPlayingWidget.push(this, s, art, connected)
+        }
+    }
+
+    /** Только текст статуса, когда состояния плеера ещё нет. */
+    private fun mirror(text: String) {
+        lastNotifText = text
+        main.post {
+            val connected = LinkBus.status.value == LinkStatus.CONNECTED
+            val s = if (connected) LinkBus.state.value else null
+            val art: Bitmap? = if (connected) LinkBus.art.value else null
+            phone.update(s, art, connected)
+            notify(s, art, text)
+            NowPlayingWidget.push(this, s, art, connected)
+        }
+    }
+
+    private fun notify(s: PlayerState?, art: Bitmap?, text: String) {
+        try {
+            getSystemService(NotificationManager::class.java)
+                .notify(PhoneSession.NOTIF_ID, phone.notification(s, art, text))
+        } catch (_: Exception) {
         }
     }
 
@@ -261,38 +346,4 @@ class LinkService : Service() {
     }
 
     private fun sleep(ms: Long) = try { Thread.sleep(ms) } catch (_: InterruptedException) {}
-
-    // ---------------------------------------------------------- уведомление
-
-    private fun buildNotification(text: String): Notification {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(CHANNEL, "Связь с плеером", NotificationManager.IMPORTANCE_LOW)
-                        .also { it.setShowBadge(false) }
-                )
-            }
-        }
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val b = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-            Notification.Builder(this, CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
-        return b.setContentTitle(getString(R.string.app_name))
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentIntent(open)
-            .setOngoing(true)
-            .build()
-    }
-
-    private fun update(text: String) {
-        try {
-            getSystemService(NotificationManager::class.java)
-                .notify(NOTIF_ID, buildNotification(text))
-        } catch (_: Exception) {
-        }
-    }
 }
